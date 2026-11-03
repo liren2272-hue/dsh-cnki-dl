@@ -1,0 +1,13 @@
+# 把本插件插进 DSH profile 的配置树（bundle 挂载声明）。
+#
+# 想改 Python 路径 / 下载落点，不必改这里：给这条 entry 加 config 即可。
+#   - id: dsh-cnki-dl
+#     name: dsh-cnki-dl
+#     config:
+#       pythonExe: 'C:/Program Files/Python311/python.exe'
+#       timeoutMs: 120000
+#       outputDir: 'D:/data/cnki'
+#       wantFormat: pdf
+- insert:
+    - id: dsh-cnki-dl
+      name: dsh-cnki-dl
