@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from .bsk import B  # bsk 路径统一解析（BSK_BIN 环境变量优先）
+from . import bsk as _bsk  # 控制策略/context 配对统一走 bsk.sync_pair，避免两处漂移
 
 TMP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "data", "tmp", "captcha")
@@ -48,8 +49,7 @@ JS_GEO = r"""(function(){
 
 JS_URL = "(function(){return JSON.stringify({u:location.href.slice(0,200),t:document.title,fl:(document.querySelector('.tencent-captcha-dy__footer-title')||{}).textContent||''});})()"
 
-TRANS = ("shared page control", "requires the context", "did not become ready",
-         "could not be attributed", "observation changed")
+TRANS = _bsk.TRANS
 
 
 def sh(a, t=120):
@@ -62,18 +62,26 @@ def sh(a, t=120):
 
 
 def ctx_of(sid):
-    sh(["cooperate", "wait", "--session", sid, "--timeout-ms", "4000"], 20)
-    m = re.search(r'"context_id": "([^"]+)"', sh(["cooperate", "sync", "--session", sid, "--json"], 40))
-    return m.group(1) if m else None
+    """兼容旧签名：只回 context。新代码用 _ctx_pair。"""
+    return _bsk.sync_pair(sid)[0]
+
+
+def _ctx_pair(sid):
+    """(context_id, observation_id|None) —— strict 会话上 evaluate 必需 obs。"""
+    return _bsk.sync_pair(sid)
+
+
+def _acts(sid):
+    return _bsk.act_args(sid)
 
 
 def ev(sid, js, tries=4):
     for _ in range(tries):
-        c = ctx_of(sid)
-        if not c:
+        a = _acts(sid)
+        if not a:
             time.sleep(1.0)
             continue
-        out = sh(["evaluate", "--session", sid, "--context", c, js], 90)
+        out = sh(["evaluate", "--session", sid] + a + [js], 90)
         if out and not any(k in out for k in TRANS):
             return out
         time.sleep(1.0)
@@ -102,14 +110,22 @@ def drop_dialogs(sid):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _dl(url, path):
+def _dl(url, path, tries=3):
+    """腾讯 CDN 偶发 10065（无法连接主机），必须重试；三次仍失败才抛出。"""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0", "Referer": "https://bar.cnki.net/"})
-    data = _OPENER.open(req, timeout=20).read()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
+    last = None
+    for i in range(tries):
+        try:
+            data = _OPENER.open(req, timeout=20).read()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            return path
+        except Exception as ex:
+            last = ex
+            time.sleep(1 + i)
+    raise last
 
 
 # ---------------- 缺口检测（形状模板 + 零和核卷积） ----------------
@@ -275,8 +291,13 @@ def plan(geo, tag="c"):
     os.makedirs(TMP, exist_ok=True)
     if not geo or geo.get("no"):
         return None
-    bgp = _dl(geo["vbUrl"], os.path.join(TMP, tag + "_bg.jpg"))
-    sp = _dl(geo["fgUrl"], os.path.join(TMP, tag + "_sprite.png"))
+    try:
+        bgp = _dl(geo["vbUrl"], os.path.join(TMP, tag + "_bg.jpg"))
+        sp = _dl(geo["fgUrl"], os.path.join(TMP, tag + "_sprite.png"))
+    except Exception as ex:
+        # 验证码图床偶发不可达（WinError 10065 等）：这里不能把整批下载带崩，
+        # 交回上层按「本次求解失败」处理，它会刷新题库重试。
+        return dict(err="图片下载失败: %s" % ex)
     tpl, box = piece_shape(sp)
     if tpl is None:
         return dict(err="sprite 里没找到拼图块")
@@ -319,14 +340,23 @@ def plan(geo, tag="c"):
 
 
 def drag(sid, dx, duration="900ms", timeout="3s"):
-    c = ctx_of(sid)
     t0 = time.time()
-    out = sh(["drag", "--session", sid, "--context", c or "",
-              "--depends-on", ".tencent-captcha-dy__slider-block",
-              "--timeout", timeout, "--duration", duration,
-              "--dx", "%.2f" % dx, "--dy", "0",
-              ".tencent-captcha-dy__slider-block"], 90)
-    return time.time() - t0, (out or "").splitlines()[0][:90] if out else ""
+    msg = ""
+    for _ in range(3):
+        a = _acts(sid)
+        if not a:
+            time.sleep(1.0)
+            continue
+        out = sh(["drag", "--session", sid] + a +
+                 ["--depends-on", ".tencent-captcha-dy__slider-block",
+                  "--timeout", timeout, "--duration", duration,
+                  "--dx", "%.2f" % dx, "--dy", "0",
+                  ".tencent-captcha-dy__slider-block"], 90)
+        msg = (out or "").splitlines()[0][:90] if out else ""
+        if out and not any(k in out for k in _bsk.TRANS):
+            break
+        time.sleep(1.0)
+    return time.time() - t0, msg
 
 
 def wait_outcome(sid, maxs=9.0):
@@ -440,7 +470,7 @@ def auto_pass(sid, rounds=6, log=print):
             if ok:
                 return True
         else:
-            ok = pass_captcha(sid, tries=2, log=log, tag="p%d" % i)
+            ok = pass_captcha(sid, tries=3, log=log, tag="p%d" % i)
             log("  [auto %d] 拼图 -> %s" % (i, ok))
             if ok:
                 return True

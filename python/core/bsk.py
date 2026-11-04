@@ -16,7 +16,10 @@ import subprocess
 import time
 
 TRANS = ("shared page control", "requires the context", "did not become ready",
-         "could not be attributed", "observation changed")
+         "could not be attributed", "observation changed",
+         "needs an explicit current observation",   # strict/target 配错或 obs 未传
+         "observed content changed", "still settling",
+         "did not complete before timeout")         # download 抖动，可重发
 
 
 def _find_bsk():
@@ -46,6 +49,63 @@ def run(args, timeout=120):
 def ok(out):
     """bsk 输出里没有协作抖动错误、且非空，就当作一次有效返回。"""
     return bool(out) and not any(k in out for k in TRANS)
+
+
+# ---- 控制策略：bsk 在会话的**第一次** cooperate sync 上绑定策略 ----
+# 实测（bsk 0.4.1）：不带 --policy 的首次 sync 会绑成 target，而 target 会话上
+# evaluate 一律被拒「this action needs an explicit current observation」，即使
+# 把 sync 返回的 observation_id 用 --observation 传回去也一样被拒。evaluate 是
+# 脚本动作，只有 strict 会话才放行 → 插件原先所有取数、验证码识别全部失效。
+# strict 会话的规律：首次 kind=baseline 的 sync 带 observation_id，之后
+# kind=unchanged 的 sync **不再返回 observation_id**，此时只带 --context 即可。
+# 于是规则：每个会话的首次 sync 固定 --policy strict，obs 有就带、没有就不带。
+POLICY = os.environ.get("CNKI_BSK_POLICY", "strict")
+_BOUND = {}   # sid -> bool：该会话的控制策略是否已经绑过
+
+
+def _grab(pat, text):
+    m = re.search(pat, text or "")
+    return m.group(1) if m else None
+
+
+def sync_pair(sid, wait_ms=5000, tries=2, log=None):
+    """一次 cooperate sync，返回 (context_id, observation_id 或 None)。
+
+    会话第一次 sync 时带上 --policy（默认 strict）绑定控制策略；若 bsk 说策略
+    已固定（会话不是我们起的），去掉 --policy 重试并把该会话记为已绑定。
+    """
+    last = ""
+    for _ in range(tries):
+        run(["cooperate", "wait", "--session", sid,
+             "--timeout-ms", str(wait_ms)], 25)
+        args = ["cooperate", "sync", "--session", sid, "--json"]
+        if POLICY and not _BOUND.get(sid):
+            args += ["--policy", POLICY]
+        out = run(args, 40)
+        last = out or ""
+        c = _grab(r'"context_id":\s*"([^"]+)"', last)
+        if c:
+            _BOUND[sid] = True
+            return c, _grab(r'"observation_id":\s*"([^"]+)"', last)
+        if "fixed for this session" in last or "invalid_params" in last:
+            _BOUND[sid] = True
+            if log:
+                log("  [bsk] 会话 %s 策略已固定，改用其既有策略" % sid)
+        if log:
+            log("  [bsk] sync 未取得 context: %s" % last[:120].replace("\n", " "))
+        time.sleep(1.0)
+    return None, None
+
+
+def act_args(sid, wait_ms=5000):
+    """给动作命令拼上 --context（以及存在时的 --observation）。"""
+    c, o = sync_pair(sid, wait_ms)
+    if not c:
+        return None
+    a = ["--context", c]
+    if o:
+        a += ["--observation", o]
+    return a
 
 
 def status():
@@ -80,18 +140,20 @@ class Session:
             run(["session", "stop", self.sid], 30)
 
     def ctx(self):
-        run(["cooperate", "wait", "--session", self.sid, "--timeout-ms", "5000"], 25)
-        out = run(["cooperate", "sync", "--session", self.sid, "--json"], 40)
-        m = re.search(r'"context_id":\s*"([^"]+)"', out)
-        return m.group(1) if m else None
+        """兼容旧调用点：只回 context（新代码请用 ctx_pair）。"""
+        return sync_pair(self.sid, log=self.log)[0]
+
+    def ctx_pair(self):
+        """(context_id, observation_id|None) —— evaluate/drag 需要后者才能过权限。"""
+        return sync_pair(self.sid, log=self.log)
 
     def ev(self, js, tries=5, timeout=90):
         for i in range(tries):
-            c = self.ctx()
-            if not c:
+            a = act_args(self.sid)
+            if not a:
                 time.sleep(1.2)
                 continue
-            out = run(["evaluate", "--session", self.sid, "--context", c, js], timeout)
+            out = run(["evaluate", "--session", self.sid] + a + [js], timeout)
             if ok(out):
                 return out
             if "USER_CANCELED" in out:      # 下载被劫持，evaluate 也可能报
@@ -100,12 +162,11 @@ class Session:
         return ""
 
     def nav(self, url, tries=4, wait="domcontentloaded", timeout="45s"):
+        out = ""
         for _ in range(tries):
-            c = self.ctx()
-            args = ["navigate", "--session", self.sid]
-            if c:
-                args += ["--context", c]
-            args += ["--wait-until", wait, "--timeout", timeout, url]
+            a = act_args(self.sid) or []
+            args = ["navigate", "--session", self.sid] + a + \
+                   ["--wait-until", wait, "--timeout", timeout, url]
             out = run(args, 100)
             if ok(out) or "error" not in (out or "").lower():
                 return out
@@ -117,25 +178,35 @@ class Session:
         """bsk download 常报 shared page control；换 context 重试同一目标即可。"""
         out = ""
         for i in range(tries):
-            c = self.ctx()
-            if not c:
+            a = act_args(self.sid)
+            if not a:
                 time.sleep(1.5)
                 continue
-            args = ["download", "--session", self.sid, "--context", c,
+            args = ["download", "--session", self.sid] + a + [
                     "--depends-on", depends_on or selector, "--selector", selector,
                     "--out", out_path, "--timeout", timeout, "--overwrite"]
             out = run(args, timeout_secs(timeout) + 60)
             if not any(k in out for k in TRANS):
                 return out
+            if os.path.exists(out_path):      # 报了抖动但文件已落盘
+                return out
             time.sleep(2.5)
         return out
 
     def drag(self, selector, dx, duration="900ms", timeout="3s"):
-        c = self.ctx()
-        out = run(["drag", "--session", self.sid, "--context", c or "",
-                   "--depends-on", selector, "--timeout", timeout,
-                   "--duration", duration, "--dx", "%.2f" % dx, "--dy", "0",
-                   selector], 90)
+        """滑块拖拽。evaluate 在 strict 会话需要 observation，drag 同理。"""
+        for _ in range(3):
+            a = act_args(self.sid)
+            if not a:
+                time.sleep(1.0)
+                continue
+            out = run(["drag", "--session", self.sid] + a + [
+                       "--depends-on", selector, "--timeout", timeout,
+                       "--duration", duration, "--dx", "%.2f" % dx, "--dy", "0",
+                       selector], 90)
+            if not any(k in out for k in TRANS):
+                return out
+            time.sleep(1.0)
         return out
 
     def tabs(self):

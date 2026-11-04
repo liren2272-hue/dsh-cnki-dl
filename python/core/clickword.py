@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from .bsk import B  # bsk 路径统一解析（BSK_BIN 环境变量优先）
+from . import bsk as _bsk  # 控制策略/context 配对统一走 bsk.sync_pair
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = os.path.join(HERE, "data", "tmp", "clickword")
@@ -50,8 +51,7 @@ JS_CLICK = ("(function(x,y){var p=document.querySelector('.verify-img-panel img'
             "p.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,clientX:X,"
             "clientY:Y,view:window,button:0}));});return JSON.stringify([X,Y]);})(%f,%f)")
 
-TRANS = ("shared page control", "requires the context", "did not become ready",
-         "could not be attributed", "observation changed")
+TRANS = _bsk.TRANS
 
 
 def sh(a, t=90):
@@ -64,18 +64,17 @@ def sh(a, t=90):
 
 
 def ctx_of(sid):
-    sh(["cooperate", "wait", "--session", sid, "--timeout-ms", "4000"], 20)
-    m = re.search(r'"context_id": "([^"]+)"', sh(["cooperate", "sync", "--session", sid, "--json"], 40))
-    return m.group(1) if m else None
+    """兼容旧签名：只回 context。"""
+    return _bsk.sync_pair(sid)[0]
 
 
 def ev(sid, js, tries=4):
     for _ in range(tries):
-        c = ctx_of(sid)
-        if not c:
+        a = _bsk.act_args(sid)
+        if not a:
             time.sleep(1)
             continue
-        out = sh(["evaluate", "--session", sid, "--context", c, js], 90)
+        out = sh(["evaluate", "--session", sid] + a + [js], 90)
         if out and not any(k in out for k in TRANS):
             return out
         time.sleep(1)

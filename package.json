@@ -1,6 +1,6 @@
 {
   "name": "dsh-cnki-dl",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "./icon.svg",
   "description": "DSH 知网（CNKI）文献检索与 PDF 批量下载插件：内嵌完整的 bsk + Python 下载器源码，对外暴露六个工具——cnki_search（检索）、cnki_download（单篇）、cnki_batch（批量）、cnki_verify（PDF 魔数复核）、cnki_doctor（环境体检）、cnki_task_status（后台进度）。知网验证码全自动通过，学位论文也走 PDF 通道。",
   "type": "module",
