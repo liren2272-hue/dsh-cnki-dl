@@ -248,10 +248,19 @@ def click_pdf(sess, sel, log=print, tries=4):
     return False, "点击一直被页面变化打断", ""
 
 
+# download-first-v2 / 2026-11-06: skip the second (stale-order) bar verification
 def fetch_via_click(sess, sel, out_dir, dst, log=print, maxwait=150):
-    """trusted 点击 → 等跳到 bar → 过拼图 → 收 Chrome 下载的文件 → 移到 dst。
+    """trusted 点击 → 收 Chrome 下载的文件 → 移到 dst。
 
     返回 (status, path, note)。status ∈ ok / verify-fail / no-jump / no-file
+
+    CNKI 期刊页的下载按钮即便被设了 target=_self，站点 JS 仍常把 bar 验证页
+    开成「新标签」；那个新标签会自己登记订单，并让 Chrome 把 PDF 原生下载到
+    ddir。受控的这一页若再 navigate 回同一个 order URL，bar 会认为订单已被
+    消费，弹「您操作已超时，请重新打开文献！」并出一道在受控页解不了的拼图，
+    每篇白白烧掉几十秒。所以改成「文件优先」：先盯下载目录，新标签下好就直接
+    收、完全跳过二次验证；只有确认没有原生下载时才退回老路径（学位论文页、
+    或受控标签真的停在 bar 验证页需要过拼图）。
     """
     ddir = chrome_dl_dir()
     log("    · 下载目录 %s" % ddir)
@@ -259,37 +268,76 @@ def fetch_via_click(sess, sel, out_dir, dst, log=print, maxwait=150):
     ok, why, order = click_pdf(sess, sel, log=log)
     if not ok:
         return "no-jump", "", why
-    # 等本标签页跳到 bar 验证页
+
+    def _peek():
+        now = _snap(ddir)
+        new = now - before
+        if any(n.endswith(".crdownload") for n in new):
+            return None                      # 还在写，等下一轮
+        done = [n for n in new if n.lower().endswith(DL_EXT)]
+        if not done:
+            return None
+        p = os.path.join(ddir, sorted(
+            done, key=lambda n: os.path.getmtime(os.path.join(ddir, n)))[-1])
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            return None
+        return (p, sz) if sz >= PDF_MIN else None
+
+    f = None
     jumped = False
-    for _ in range(10):
+    seen = None
+    # 观察窗：~30s。每轮「先查文件、再看跳转」，文件优先——新标签一旦落盘就
+    # 收下并跳过二次验证（也就不会再有「操作已超时」弹窗与无解拼图）。
+    # 不用固定 10s 是因为大文件写 .crdownload 可能超过 10s，提前退出会误判。
+    for _ in range(30):
         st = bsk.js_call(sess, "(function(){return JSON.stringify({u:location.href.slice(0,120)});})()") or {}
         u = st.get("u") or ""
         if "bar.cnki.net" in u:
             jumped = True
+        cand = _peek()
+        if cand and cand == seen:            # 大小稳定 ≥1s，认为下载完成
+            f = cand[0]
             break
+        seen = cand
         time.sleep(1.0)
-    if not jumped:
-        # 学位论文页的下载按钮是 JS 处理，点击会把 bar 开成新标签（user 作用域，
-        # 拿不到控制权）。但订单已经登记，用同一个订单 URL 在本标签打开验证页即可。
+
+    if f:
+        log("    · 新标签已原生下载，跳过二次验证（不再触发「操作已超时」弹窗）")
+        bsk.drop_dialogs(sess)
+    elif jumped:
+        # 受控标签停在 bar 验证页：正常过拼图再等文件。
+        time.sleep(0.8)
+        bsk.drop_dialogs(sess)
+        passed = captcha.auto_pass(sess.sid, rounds=6, log=log)
+        f = _wait_new_file(ddir, before, maxwait=(maxwait if passed else 8), log=log)
+        if not passed and not f:
+            return "verify-fail", "", "拼图验证码未通过"
+    else:
+        # 既没跳 bar、也没等到文件：学位论文页的按钮由 JS 处理，订单已登记，
+        # 但新标签没触发下载。退回老路径——用同一订单 URL 在本标签打开验证页。
         if not order:
             return "no-jump", "", "点击后没跳到 bar，且取不到订单 URL"
         import urllib.parse as _up
         vurl = ("https://bar.cnki.net/bar/verify/index.html?platform=nxgp&returnUrl="
                 + _up.quote(order, safe=""))
-        log("    · 按钮开在新标签，改用订单 URL 在本标签验证")
+        log("    · 按钮开在新标签且未下载，改用订单 URL 在本标签验证")
         sess.nav(vurl)
         time.sleep(3.0)
         st = bsk.js_call(sess, "(function(){return JSON.stringify({u:location.href.slice(0,120)});})()") or {}
         if "bar.cnki.net" not in (st.get("u") or ""):
             return "no-jump", "", "订单 URL 也没打开验证页"
-    time.sleep(0.8)
-    bsk.drop_dialogs(sess)
-    passed = captcha.auto_pass(sess.sid, rounds=6, log=log)
-    if not passed:
-        return "verify-fail", "", "拼图验证码未通过"
-    f = _wait_new_file(ddir, before, maxwait=maxwait, log=log)
+        time.sleep(0.8)
+        bsk.drop_dialogs(sess)
+        captcha.auto_pass(sess.sid, rounds=6, log=log)
+        f = _wait_new_file(ddir, before, maxwait=maxwait, log=log)
+
+    if not f:
+        f = _wait_new_file(ddir, before, maxwait=maxwait, log=log)
     if not f:
         return "no-file", "", "验证通过但没等到下载文件"
+
     kind, size, head = probe(f)
     target = dst
     if kind in ("caj", "kdh", "hn", "kdf"):

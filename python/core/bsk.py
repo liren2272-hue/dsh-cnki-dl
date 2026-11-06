@@ -126,13 +126,23 @@ class Session:
 
     # ---------- 基础 ----------
     def start(self, name="cnki"):
-        out = run(["session", "start", "--name", name], 60)
-        m = re.search(r'"session_id":\s*"([^"]+)"', out) or re.search(r"\b([a-z0-9]{4})\b\s*$", out)
-        if not m:
-            tail = out.strip().splitlines()[-1] if out.strip() else ""
-            self.sid = tail.split()[-1]
-        else:
+        # session-start-v2 / 2026-11-06: bsk CLI 会把「发现新版本」提示写到
+        # stderr，而 run() 把 stdout+stderr 拼在一起；旧实现不带 --json，
+        # fallback 取「末行最后一词」会拿到 'supervisor.' 当 sid，导致之后
+        # 所有 --session 动作挂起。改为结构化取 session_id，兜底只认独立
+        # 成行的 4 位小写字母数字（真 sid 形如 elud / mfgz）。
+        out = run(["session", "start", "--name", name, "--json"], 60)
+        m = re.search(r'"session_id":\s*"([^"]+)"', out)
+        if m:
             self.sid = m.group(1)
+            return self.sid
+        for line in (out or "").splitlines():
+            t = line.strip()
+            if re.fullmatch(r"[a-z0-9]{4}", t):
+                self.sid = t
+                return self.sid
+        tail = out.strip().splitlines()[-1] if out.strip() else ""
+        self.sid = tail.split()[-1]
         return self.sid
 
     def stop(self):
