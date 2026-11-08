@@ -4,3 +4,7 @@ node_modules/
 Thumbs.db
 *.swp
 *.bak
+
+# Byte-compiled / generated
+__pycache__/
+python/data/
