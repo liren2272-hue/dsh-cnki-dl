@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from core import bsk, pages, fetch, batch      # noqa: E402
+from core import bsk, pages, fetch, batch, doi, guard   # noqa: E402
 from core import captcha                        # noqa: E402
 
 try:                                            # 中文输出永远走 UTF-8
@@ -173,6 +173,66 @@ def cmd_batch(args):
                      limit=args.limit)
 
 
+
+# --------------------------------------------------------------------------- doibatch
+def cmd_doibatch(args):
+    """按 DOI 清单批量补英文 OA 全文（Unpaywall → 直链兜底），直链不走浏览器。"""
+    from core import doi as _doi
+    from core import cite
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+    text = io.open(args.list, encoding="utf-8", errors="replace").read()
+    dois = _doi.parse_dois(text)
+    log("解析到 %d 个 DOI" % len(dois))
+    st = batch.load_state(out)
+    ok = nooa = fail = 0
+    for i, d in enumerate(dois, 1):
+        key = ("doi:" + d).lower()
+        prev = st["done"].get(key)
+        if prev and prev.get("status") == "ok":
+            log("[%d/%d] 跳过（已完成）%s" % (i, len(dois), d))
+            continue
+        r = _doi.fetch_by_doi(d, email=args.email, log=log)
+        if not r:
+            log("    ! 未找到 %s" % d)
+            st["done"][key] = {"title": d, "status": "not-found", "doi": d}
+            fail += 1
+            continue
+        if not r["pdf_link"]:
+            nooa += 1
+            log("    ~ 有元数据无 OA PDF：%s" % r["title"][:50])
+            st["done"][key] = {"title": r["title"], "status": "no-oa", "doi": d}
+            continue
+        fname = fetch.safe_name(r["title"] or d)
+        dst = os.path.join(out, "%02d_%s.pdf" % (i, fname))
+        res = _doi.download(r["pdf_link"], dst, log=log)
+        rec = {"idx": i, "title": r["title"], "kind": "doi", "status": res["status"],
+               "file": res.get("file", ""), "bytes": res.get("bytes", 0),
+               "format": res.get("format", ""), "doi": d,
+               "authors": r.get("authors", ""), "source": r.get("source", ""),
+               "year": r.get("year", ""), "pdf_source": r["pdf_source"],
+               "note": res.get("note", "")}
+        st["done"][key] = rec
+        if res["status"] == "ok":
+            ok += 1
+            log("    \u2713 %s  %.2fMB  [%s]" % (r["title"][:40],
+                res["bytes"] / 1048576.0, r["pdf_source"]))
+        else:
+            fail += 1
+            log("    ! %s" % res.get("note"))
+    batch.save_state(out, st)
+    batch.write_manifest(out, {"items": list(st["done"].values()),
+                               "done": st["done"]})
+    # 同步产出题录：references.txt(GB/T 7714 国标) + .bib + .ris
+    try:
+        recs = cite.to_records(list(st.get("done", {}).values()))
+        cite.write_all(out, recs)
+    except Exception as e:
+        log("    · 题录导出失败：%s" % e)
+    log("\n汇总：PDF %d / 无 OA %d / 失败 %d" % (ok, nooa, fail))
+    return 0 if fail == 0 else 1
+
+
 # --------------------------------------------------------------------------- verify
 def cmd_verify(args):
     root = os.path.abspath(args.dir)
@@ -253,6 +313,80 @@ def cmd_selftest(args):
     ck("状态可写回", batch.load_state(d)["items"][0]["title"] == "测试")
     p = batch.write_manifest(d, st)
     ck("清单已生成", os.path.exists(p) and "测试" in open(p, encoding="utf-8-sig").read())
+
+    # 7 访问守卫（节奏 + 验证码退避）
+    clock = {"t": 1000.0}
+    g = guard.CnkiGuard(min_interval_sec=4.0, now=lambda: clock["t"])
+    ck("守卫：知网 URL 首次放行", g.wait_needed() == 0.0)
+    g.note_download()
+    ck("守卫：间隔内需等待", g.wait_needed() > 0)
+    clock["t"] += 5.0
+    ck("守卫：超过最小间隔即放行", g.wait_needed() == 0.0)
+    cd1 = g.note_captcha()
+    cd2 = g.note_captcha()
+    ck("守卫：验证码指数退避递增", cd2 > cd1, "%s vs %s" % (cd1, cd2))
+    ck("守卫：退避期内需等待", g.wait_needed() > 0)
+    clock["t"] += cd2 + 1
+    ck("守卫：冷却结束放行", g.wait_needed() == 0.0)
+    g.note_ok()
+    ck("守卫：成功复位连续失败计数", g.captcha_streak == 0)
+    ck("守卫：非知网 URL 不拦", guard.CNKI_HOST_RE.search("https://example.com/x") is None)
+    ck("守卫：bar 下载端点命中", guard.CNKI_DOWNLOAD_RE.search("https://bar.cnki.net/bar/download/order") is not None)
+    ck("守卫：URL 解码绕过仍命中", guard.CNKI_DOWNLOAD_RE.search(
+        guard.normalize("https://kns.cnki.net/%2564ownload.aspx")) is not None)
+
+    # 8 DOI 提取 / PDF 头校验
+    dois = doi.parse_dois("见 10.1000/j.xyz.2024.001 与 10.1000/J.XYZ.2024.001 与 10.1016/abc")
+    ck("DOI 小写去重", len(dois) == 2, str(dois))
+    ck("DOI 保留首现原样", dois[0] == "10.1000/j.xyz.2024.001", str(dois))
+    ck("DOI 提取无遗漏", "10.1016/abc" in dois)
+    pdf_head = b"%PDF-1.7 rest"
+    ck("doi：PDF 头判真", doi._is_pdf_head(pdf_head, "application/pdf"))
+    ck("doi：HTML 头判假", not doi._is_pdf_head(b"<html>...", "text/html"))
+
+    # 9 题录导出（GB/T 7714 国标 + 字符串作者切分）
+    from core import cite as _cite
+    recs = _cite.to_records([
+        {"title": "农业文化遗产的保护与利用", "authors": "张三; 李四; 王五",
+         "kind": "journal", "source": "生态学报", "year": "2024"},
+        {"title": "Urban heritage", "authors": "Smith J; Doe A",
+         "kind": "doi", "source": "Nature Cities", "year": "2023", "doi": "10.1038/x"},
+    ])
+    ck("cite：字符串作者正确切分为列表", recs[0].authors == ["张三", "李四", "王五"], str(recs[0].authors))
+    ck("cite：DOI 英文字符串作者不被拆成单字", recs[1].authors == ["Smith J", "Doe A"], str(recs[1].authors))
+    ck("cite：中文期刊 GB/T 7714 ≤3作者全列",
+       _cite.gb7714(recs[0]).startswith("张三, 李四, 王五."), _cite.gb7714(recs[0]))
+    ck("cite：>3作者取前3+等",
+       _cite.gb7714(_cite.CiteRec(title="遗产保护研究", authors=["甲", "乙", "丙", "丁"],
+       kind="journal", year="2024", source="生态学报")).startswith("甲, 乙, 丙, 等."),
+       _cite.gb7714(_cite.CiteRec(title="遗产保护研究", authors=["甲", "乙", "丙", "丁"],
+       kind="journal", year="2024", source="生态学报")))
+    ck("cite：硕士论文 GB/T 7714 含[D]与保存地",
+       "[D]." in _cite.gb7714(_cite.CiteRec(title="研究", authors=["钱八"],
+       kind="thesis", year="2022", source="东南大学", address="南京")), _cite.gb7714(
+       _cite.CiteRec(title="研究", authors=["钱八"], kind="thesis", year="2022",
+       source="东南大学", address="南京")))
+    # 10 超时兜底（_timed_out：命中「操作已超时」→ 放弃当前模式刷新重进）
+    class _FakeSess(object):
+        sid = "FAKE"
+        def ctx(self):
+            return "ctx"
+    _fs = _FakeSess()
+    _orig_jc = fetch.bsk.js_call
+    _orig_dd = fetch.bsk.drop_dialogs
+    try:
+        fetch.bsk.js_call = lambda s, js: {"hit": True, "u": "https://bar.cnki.net/x"}
+        fetch.bsk.drop_dialogs = lambda s: None
+        ck("超时兜底：命中「操作已超时」→判该放弃重来", fetch._timed_out(_fs, log=lambda *a, **k: None))
+        fetch.bsk.js_call = lambda s, js: {"hit": False, "u": "https://kns.cnki.net/y"}
+        ck("超时兜底：未命中弹窗文案→不放弃",
+           not fetch._timed_out(_fs, log=lambda *a, **k: None))
+        fetch.bsk.js_call = lambda s, js: (_ for _ in ()).throw(RuntimeError("bsk down"))
+        ck("超时兜底：检测异常不阻断(返回 False)",
+           not fetch._timed_out(_fs, log=lambda *a, **k: None))
+    finally:
+        fetch.bsk.js_call = _orig_jc
+        fetch.bsk.drop_dialogs = _orig_dd
     return 0 if not fail else 1
 
 
@@ -298,6 +432,12 @@ def main(argv=None):
     p.add_argument("--want", default="pdf", choices=["pdf", "caj"])
     p.add_argument("--sid")
     p.set_defaults(fn=cmd_batch)
+
+    p = sub.add_parser("doibatch", help="按 DOI 清单批量补英文 OA 全文")
+    p.add_argument("--list", required=True, help="含 DOI 的文本文件（自由文本即可）")
+    p.add_argument("--out", default=os.path.join(HERE, "data", "downloads"))
+    p.add_argument("--email", default=doi.DEFAULT_EMAIL, help="Unpaywall 联系邮箱")
+    p.set_defaults(fn=cmd_doibatch)
 
     p = sub.add_parser("verify", help="按魔数复核目录里的 PDF")
     p.add_argument("dir")

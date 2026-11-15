@@ -6,14 +6,13 @@
 
 产物：`<out>/NN_标题.pdf`、`<out>/文献清单.csv`、`<out>/_state.json`（断点续跑）。
 
-## 〇、本机安装状态（2026-11-01 安装）
+## 〇、安装
 
-* 安装位置：`D:\Tools\cnki-dl`（整目录自包含，代码按 `__file__` 相对取路径，可整体搬移）
-* 全局命令：`cnki-dl`（`D:\Tools\cnki-dl\cnki-dl.cmd`，已写入**用户 PATH**；
-  启动器固定 `BSK_AUTO_START=0`、`PYTHONIOENCODING=utf-8`，调用系统 `C:\Program Files\Python311\python.exe`）
-* 默认下载目录：`D:\Tools\cnki-dl\data\downloads`
-* 自检：`cnki-dl selftest`（离线，全绿）/ `cnki-dl doctor`（需浏览器在线）
-* 新开终端才会识别 PATH；已开着的窗口重启一下即可。
+* 整目录自包含，代码按 `__file__` 相对取路径，可整体搬移到任意位置。
+* 依赖：本机装有 `bsk`（本地浏览器控制 CLI）+ Python 3（在 `python/` 下 `python run.py ...`）。
+* 建议设 `PYTHONIOENCODING=utf-8`，避免 Windows 终端中文乱码。
+* 默认下载目录：`python/data/downloads`（可用 `--out` 覆盖）。
+* 自检：`python run.py selftest`（离线，全绿）/ `python run.py doctor`（需浏览器在线）。
 
 ## 一、快速开始
 
@@ -25,6 +24,7 @@ python run.py batch  安化黑茶 --type thesis --top 5 --out D:/out/thesis
 python run.py batch  安化黑茶 --type journal --top 5 --out D:/out/journal
 python run.py download "<详情页URL>" --out D:/out/one    # 单篇
 python run.py verify  D:/out/thesis        # 按文件魔数复核已下载的 PDF
+python run.py doibatch --list dois.txt --out D:/out/en   # 按 DOI 清单补英文 OA 全文（不走浏览器）
 python run.py selftest                     # 离线自测，不需要浏览器
 ```
 
@@ -93,14 +93,25 @@ bar 的验证/下载页会把标签页「焊」在 `bar.cnki.net` 上：之后 `
 ## 四、代码结构
 
 ```
-run.py            命令行入口（doctor/captcha/search/download/batch/verify/selftest）
+run.py            命令行入口（doctor/captcha/search/download/batch/doibatch/verify/selftest）
 core/bsk.py       bsk 封装：Session（start/ctx/ev/nav/fresh_tab/stop）、TRANS 抖动重试
 core/pages.py     检索页：search_url/rows_of/norm_rows/row_kind/switch/detail/is_verify
 core/captcha.py   拼图验证码：JS_GEO/bg_crop/find_gap/plan/drag/pass_captcha/auto_pass
 core/clickword.py 文字点选验证码：纯色抠字 + 旋转扫描 RapidOCR + 合成 MouseEvent 点击
 core/fetch.py     详情页：_wait_nav/open_detail/click_pdf/fetch_via_click/grab/probe
-core/batch.py     队列：collect（切库/排序/去重）+ run（断点续跑/清单）+ RESUME_AT
+core/batch.py     队列：collect（切库/排序/去重）+ run（断点续跑/守卫节奏/验证码退避重试/清单）
+core/guard.py     访问守卫：最小间隔 + 验证码指数退避冷却（不做硬配额，配合自动过码）
+core/doi.py       DOI 补源：parse_dois/fetch_by_doi（Unpaywall→直链兜底）/download，直链不走浏览器
+core/cite.py      题录导出：GB/T 7714 国标（默认）+ BibTeX(.bib) + RIS(.ris)，batch/doibatch 自动产出
 ```
+
+### 题录导出（跟着国标走）
+`batch` 和 `doibatch` 每次下载完，都会在输出目录里额外写三份题录文件（已下载的每篇都进去，按原顺序编号）：
+- `references.txt` —— **GB/T 7714-2015 国标格式**，带 `[1]` 序号，中文文献用「等」、英文用「et al」，类型标识 `[J]`/`[D]`/`[M]`… 自动判
+- `references.bib` —— BibTeX（LaTeX），cite key = 第一作者姓+年+题名首词
+- `references.ris` —— RIS（EndNote/NoteExpress/Zotero 通用导入）
+
+知网下载行本身没有作者/年份，因此中文文献的题录偏简（只到「标题[类型]. 来源, 年.」）；DOI 补源的英文文献会带全作者/期刊/年份。要完整国标题录，可在知网页面「导出与分析 → 导出文献」选 GB/T 7714 导出后另存。
 
 ### 切库的两个坑
 
@@ -122,7 +133,7 @@ core/batch.py     队列：collect（切库/排序/去重）+ run（断点续跑
 | 拿到的是 CAJ | 该篇只有 CAJ，`want=pdf` 时记为 `caj-only` 并跳过 |
 
 下载目录不是猜的：`chrome_dl_dir()` 读 Chrome `Preferences` 里的 `download.default_directory`
-（本机是 `D:\智达云`）。
+（各机器不同）。
 
 ## 六、实测记录（2026-10-31 ~ 11-01）
 
@@ -132,6 +143,25 @@ core/batch.py     队列：collect（切库/排序/去重）+ run（断点续跑
 
 
 ## 七、更新记录
+
+### 0.1.3（2026-11-15，功能增强）
+
+借鉴社区插件（wenxian-helper / cnki-assist）落地三项改进 + 一处「操作已超时」事后兜底，
+`selftest` 39 项全绿：
+
+* **知网访问守卫 `core/guard.py`**：每篇下载之间强制节奏（默认 ≥4s），验证码失败按指数
+  退避冷却（60→120→240s 封顶，成功复位）。**无硬配额**——本机能自动过码，只管节奏不管
+  次数；`CNKI_DOWNLOAD_RE` 命中下载端点一律拦下且不占额度，防 URL 编码绕过（3 轮
+  decode）。挂到 `batch` 循环 `fetch.grab` 调用点。
+* **DOI 补英文 OA 全文 `core/doi.py` + `doibatch` 命令**：读含 DOI 的自由文本 → 逐条
+  Unpaywall 取 `best_oa_location.url_for_pdf` → 无 OA 则退 `sci.bban.top` 直链 →
+  `Range: bytes=0-1023` 验 `%PDF-` 魔数 + content-type 非 html/json/xml → 落盘。
+* **国标题录导出 `core/cite.py`**：`batch`/`doibatch` 跑完自动在产物目录写
+  `references.txt`（GB/T 7714 顺序编码，默认）/`.bib`/`.ris` 三件套，作者 >3 取前 3 +「等 /
+  et al」，中英文按汉字判语种，论文 `[D]` 带保存地。
+* **「操作已超时」事后兜底 `fetch._timed_out`**：download-first 已尽量让 bar 不弹这个
+  弹窗；一旦真弹了，检测到「您操作已超时，请重新打开文献！」就放弃当前工作模式，刷新重进
+  详情页重下（`grab()` 的 attempts 循环复用既有 `open_detail` 路径），不再反复撞无解拼图。
 
 ### 0.1.2（2026-11-06，bugfix）
 

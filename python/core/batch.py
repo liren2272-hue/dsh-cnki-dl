@@ -16,8 +16,10 @@ from . import bsk
 from . import pages
 from . import fetch
 from . import captcha
+from . import guard as guard_mod
+from . import cite
 
-DELAY = (1.5, 3.0)
+DELAY = (1.5, 3.0)   # 基础抖动；实际间隔由守卫.min_interval_sec 兜底（取更大者）
 
 
 def norm_title(t):
@@ -122,7 +124,9 @@ def run(items, out_dir, sid=None, log=print, want="pdf", limit=None):
     done = st.setdefault("done", {})
     log("队列 %d 篇，已完成 %d 篇（断点续跑）" % (len(items), len(done)))
 
+    g = guard_mod.CnkiGuard()
     ok = caj = noent = fail = skip = 0
+    retry_tail = []   # 验证码退避后重试的尾巴
     try:
         for n, item in enumerate(items, 1):
             if limit and n > limit:
@@ -132,6 +136,12 @@ def run(items, out_dir, sid=None, log=print, want="pdf", limit=None):
                 log("[%d/%d] 跳过（已完成）%s" % (n, len(items), item.get("title", "")[:40]))
                 skip += 1
                 continue
+            # 守卫节奏：距上次下载 ≥ min_interval；验证码冷却时在这里睡
+            wait = g.wait_needed()
+            if wait > 0:
+                cool = "（风控冷却）" if g.captcha_streak else ""
+                log("    · 守卫等待 %.0fs%s" % (wait, cool))
+                time.sleep(wait)
             log("[%d/%d] %s" % (n, len(items), (item.get("title") or "")[:60]))
             # 每篇一个全新会话 + 新标签：bar 的验证/下载页会把旧标签拽在
             # bar 域上（后续 navigate 被拉回），实测跨篇复用会话必卡死。
@@ -145,6 +155,7 @@ def run(items, out_dir, sid=None, log=print, want="pdf", limit=None):
                     sess.stop()
                 except Exception:
                     pass
+            g.note_download()
             res["idx"] = item.get("idx") or n
             res["secs"] = round(time.time() - t0, 1)
             done[key] = res
@@ -162,28 +173,70 @@ def run(items, out_dir, sid=None, log=print, want="pdf", limit=None):
 
             if res["status"] == "ok":
                 ok += 1
+                g.note_ok()
                 log("    ✓ PDF %d KB %s (%.1fs)" % (res["bytes"] // 1024,
                                                    os.path.basename(res["file"]),
                                                    res.get("secs", 0)))
             elif res["status"] == "caj-only":
                 caj += 1
+                g.note_ok()
                 log("    ~ 只有 %s：%s" % (res.get("format") or "CAJ",
                                           os.path.basename(res.get("file") or "-")))
             elif res["status"] == "no-entry":
                 noent += 1
                 log("    - 无下载入口，跳过")
             elif res["status"] == "captcha-fail":
+                # 本机已能自动破验证码（grab attempts=3 内部重试）；走到这里说明
+                # 自动过码也被挡 → 指数退避冷却，收进尾巴稍后重试，不再整批硬停。
                 fail += 1
-                log("    ! 验证码未通过，停在第 %d 条：%s" % (n, item.get("title", "")[:40]))
-                write_manifest(out_dir, st)
-                print("\nRESUME_AT=%d" % n)
-                return 2
+                cd = g.note_captcha()
+                retry_tail.append(item)
+                log("    ! 验证码未通过：%s → 退避 %.0fs 后重试（尾巴共 %d 条）"
+                    % (item.get("title", "")[:40], cd, len(retry_tail)))
             else:
                 fail += 1
                 log("    ! 失败：%s" % (res.get("note") or res["status"]))
             time.sleep(random.uniform(*DELAY))
+
+        # —— 尾巴重试：只重跑验证码失败的条目，走同一守卫（此时已冷却）——
+        if retry_tail:
+            log("\n== 尾巴重试 %d 条 ==" % len(retry_tail))
+            for item in retry_tail:
+                key = norm_title(item.get("title"))
+                wait = g.wait_needed()
+                if wait > 0:
+                    time.sleep(wait)
+                log("[重试] %s" % (item.get("title") or "")[:60])
+                sess = bsk.Session(name="cnki-dl", log=log)
+                try:
+                    res = fetch.grab(sess, item, out_dir, log=log, want=want)
+                finally:
+                    try:
+                        sess.stop()
+                    except Exception:
+                        pass
+                g.note_download()
+                res["idx"] = item.get("idx") or 0
+                done[key] = res
+                if res["status"] == "ok":
+                    ok += 1
+                    fail -= 1
+                    g.note_ok()
+                    log("    ✓ 重试成功 PDF %d KB" % (res["bytes"] // 1024))
+                elif res["status"] == "captcha-fail":
+                    g.note_captcha()
+                    log("    ! 重试仍验证码未通过（可稍后重跑续传）")
+                else:
+                    log("    · 重试结果：%s" % (res.get("note") or res["status"]))
+                time.sleep(random.uniform(*DELAY))
     finally:
         write_manifest(out_dir, st)
+        # 同步产出题录：references.txt(GB/T 7714 国标) + .bib + .ris
+        try:
+            recs = cite.to_records(list(st.get("done", {}).values()))
+            cite.write_all(out_dir, recs)
+        except Exception as e:  # 题录失败不影响下载结果
+            log("    · 题录导出失败：%s" % e)
 
     log("\n汇总：PDF %d / 仅私有格式 %d / 无入口 %d / 失败 %d / 跳过 %d"
         % (ok, caj, noent, fail, skip))

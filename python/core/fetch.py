@@ -248,6 +248,33 @@ def click_pdf(sess, sel, log=print, tries=4):
     return False, "点击一直被页面变化打断", ""
 
 
+# 事后兜底 / 2026-11-15: 「您操作已超时，请重新打开文献！」弹窗检测。
+# download-first 已尽量让 bar 不弹这个（新标签原生下���就不二次验证）；但只要
+# 真的弹了（订单被消费/超时），当前受控页就废了——解不了它的拼图、点下载也
+# 只会反复弹。正确做法是「放弃本篇当前模式，刷新重进下载页」。这里只负责
+# 检测 + 放弃：返回 timeout-reenter，让 grab() 的 attempts 循环 refresh 重来。
+TIMEOUT_MARK = "操作已超时"
+
+
+def _timed_out(sess, log=print):
+    """受控页若弹出「操作已超时」，关掉弹窗并放弃本篇（返回 True 表示该重来）。"""
+    try:
+        st = bsk.js_call(sess, "(function(){var t=(document.body&&document.body.innerText)||'';"
+                         "return JSON.stringify({hit:t.indexOf('操作已超时')>=0,"
+                         "u:location.href.slice(0,120)});})()") or {}
+    except Exception as ex:
+        log("    · 超时弹窗检测失败(不阻断)：%s" % ex)
+        return False
+    if not st.get("hit"):
+        return False
+    log("    ! 命中「您操作已超时，请重新打开文献！」→ 放弃当前模式，刷新重进下载页")
+    try:
+        bsk.drop_dialogs(sess)
+    except Exception:
+        pass
+    return True
+
+
 # download-first-v2 / 2026-11-06: skip the second (stale-order) bar verification
 def fetch_via_click(sess, sel, out_dir, dst, log=print, maxwait=150):
     """trusted 点击 → 收 Chrome 下载的文件 → 移到 dst。
@@ -307,9 +334,11 @@ def fetch_via_click(sess, sel, out_dir, dst, log=print, maxwait=150):
         log("    · 新标签已原生下载，跳过二次验证（不再触发「操作已超时」弹窗）")
         bsk.drop_dialogs(sess)
     elif jumped:
-        # 受控标签停在 bar 验证页：正常过拼图再等文件。
+        # 受控标签停在 bar 验证页：先确认没弹「操作已超时」，否则放弃重来。
         time.sleep(0.8)
         bsk.drop_dialogs(sess)
+        if _timed_out(sess, log=log):
+            return "timeout-reenter", "", "订单已超时，需刷新重进"
         passed = captcha.auto_pass(sess.sid, rounds=6, log=log)
         f = _wait_new_file(ddir, before, maxwait=(maxwait if passed else 8), log=log)
         if not passed and not f:
@@ -330,6 +359,8 @@ def fetch_via_click(sess, sel, out_dir, dst, log=print, maxwait=150):
             return "no-jump", "", "订单 URL 也没打开验证页"
         time.sleep(0.8)
         bsk.drop_dialogs(sess)
+        if _timed_out(sess, log=log):
+            return "timeout-reenter", "", "订单已超时，需刷新重进"
         captcha.auto_pass(sess.sid, rounds=6, log=log)
         f = _wait_new_file(ddir, before, maxwait=maxwait, log=log)
 
@@ -411,6 +442,15 @@ def grab(sess, item, out_dir, log=print, want="pdf", attempts=3):
         res["note"] = note
         if st == "verify-fail":
             return dict(res, status="captcha-fail", title=real_title, note=note)
+        if st == "timeout-reenter":
+            # 放弃当前模式；循环顶部的 open_detail() 会重新 nav 详情页=刷新重进。
+            res["note"] = note
+            if a < attempts:
+                log("    · 第 %d 次因「操作已超时」放弃，刷新重进详情页重下" % a)
+                time.sleep(1.5)
+                continue
+            return dict(res, status="captcha-fail", title=real_title,
+                        note="反复「操作已超时」：" + note)
         log("    · 第 %d 次失败：%s" % (a, note))
         time.sleep(1.5)
 
